@@ -86,9 +86,7 @@ async def start_message(c, m):
                     InlineKeyboardButton(
                         "➕ Add Me To Your Channel",
                         url=f"https://t.me/{bot_username}?startchannel=true"
-                    )
-                ],
-                [
+                    ),
                     InlineKeyboardButton(
                         "➕ Add Me To Your Group",
                         url=f"https://t.me/{bot_username}?startgroup=true"
