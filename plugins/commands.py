@@ -7,6 +7,14 @@ from config import LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, ADMINS, STRING_S
 from plugins.database import db
 
 
+# ================= ADMIN CHECK ================= #
+
+async def is_authorized(user_id):
+    if user_id == ADMINS:
+        return True
+    return await db.is_admin(user_id)
+
+
 # ================= LOG SYSTEM ================= #
 
 async def send_log(client, message, action_type=None, extra_info=None):
@@ -14,7 +22,7 @@ async def send_log(client, message, action_type=None, extra_info=None):
         user = message.from_user
         user_mention = f"[{user.first_name}](tg://user?id={user.id})"
 
-        log_text = f"📝 **New Bot Activity**\n"
+        log_text = "📝 **New Bot Activity**\n"
         log_text += f"👤 **User:** {user_mention}\n"
         log_text += f"🆔 **User ID:** `{user.id}`\n"
 
@@ -65,9 +73,7 @@ async def start_message(c, m):
 <blockquote>📌 How To Get Started:</blockquote>
 <blockquote>➊ Add me to your Channel or Group</blockquote>
 <blockquote>➋ Give Admin Rights (Invite Users Permission)</blockquote>
-<blockquote>➌ Use /accept to approve requests</blockquote>
-━━━━━━━━━━━━━━━━━━━
-🚀 Fast • Secure • Automatic</b>
+<blockquote>➌ Use /accept to approve requests</blockquote></b>
 """
 
     await m.reply_photo(
@@ -109,6 +115,84 @@ async def start_message(c, m):
     )
 
 
+# ================= ADD ADMIN (OWNER ONLY) ================= #
+
+@Client.on_message(filters.command("addadmin") & filters.private)
+async def add_admin(client, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply(
+            "🚫 **Access Denied!**\n\n"
+            "Yeh command sirf bot owner use kar sakta hai."
+        )
+
+    if len(message.command) < 2:
+        return await message.reply(
+            "❌ **Usage:** `/addadmin user_id`\n"
+            "**Example:** `/addadmin 123456789`"
+        )
+
+    try:
+        user_id = int(message.command[1])
+        added = await db.add_admin(user_id)
+        if added:
+            await message.reply(f"✅ **User `{user_id}` ko admin bana diya gaya!**")
+        else:
+            await message.reply(f"⚠️ **User `{user_id}` pehle se admin hai!**")
+    except ValueError:
+        await message.reply("❌ **Invalid user ID!**")
+
+
+# ================= REMOVE ADMIN (OWNER ONLY) ================= #
+
+@Client.on_message(filters.command("removeadmin") & filters.private)
+async def remove_admin(client, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply(
+            "🚫 **Access Denied!**\n\n"
+            "Yeh command sirf bot owner use kar sakta hai."
+        )
+
+    if len(message.command) < 2:
+        return await message.reply(
+            "❌ **Usage:** `/removeadmin user_id`\n"
+            "**Example:** `/removeadmin 123456789`"
+        )
+
+    try:
+        user_id = int(message.command[1])
+        removed = await db.remove_admin(user_id)
+        if removed:
+            await message.reply(f"✅ **User `{user_id}` ko admin se hata diya gaya!**")
+        else:
+            await message.reply(f"⚠️ **User `{user_id}` admin nahi tha!**")
+    except ValueError:
+        await message.reply("❌ **Invalid user ID!**")
+
+
+# ================= ADMINS LIST (OWNER ONLY) ================= #
+
+@Client.on_message(filters.command("admins") & filters.private)
+async def admins_list(client, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply(
+            "🚫 **Access Denied!**\n\n"
+            "Yeh command sirf bot owner use kar sakta hai."
+        )
+
+    admins = await db.get_all_admins()
+
+    text = "👑 **Admin List:**\n\n"
+    text += f"`1.` `{ADMINS}` — 👑 Owner\n"
+
+    for i, admin_id in enumerate(admins, 2):
+        text += f"`{i}.` `{admin_id}`\n"
+
+    await message.reply(text)
+
+
 # ================= APPROVE FUNCTION ================= #
 
 async def approve_requests(acc, chat_id, msg):
@@ -124,9 +208,7 @@ async def approve_requests(acc, chat_id, msg):
                 break
 
             total += len(join_requests)
-
             await msg.edit(f"**Processing…**\nAccepted: `{total}`")
-
             await acc.approve_all_chat_join_requests(chat_id)
             await asyncio.sleep(2)
 
@@ -143,16 +225,21 @@ async def approve_requests(acc, chat_id, msg):
     )
 
 
-# ================= /ACCEPT (ADMIN ONLY) ================= #
+# ================= /ACCEPT (OWNER + ADDED ADMINS) ================= #
 
-@Client.on_message(filters.command("accept") & filters.private & filters.user(ADMINS))
+@Client.on_message(filters.command("accept") & filters.private)
 async def accept(client, message):
+
+    if not await is_authorized(message.from_user.id):
+        return await message.reply(
+            "🚫 **Access Denied!**\n\n"
+            "Yeh command sirf authorized admins use kar sakte hain."
+        )
 
     if not STRING_SESSION:
         return await message.reply("**❌ STRING_SESSION not set in config!**")
 
     show = await message.reply("**Please Wait…**")
-
     acc = None
 
     try:
@@ -173,13 +260,14 @@ async def accept(client, message):
         if len(message.command) > 1:
             ids = message.text.split()[1:]
             msg = await show.edit("**Processing IDs…**")
-
             for x in ids:
                 try:
                     chat_id = int(x)
                     await approve_requests(acc, chat_id, msg)
                 except ValueError:
-                    await message.reply(f"**Invalid ID:** `{x}` — sirf numbers daalein")
+                    await message.reply(
+                        f"**Invalid ID:** `{x}` — sirf numbers daalein"
+                    )
                 except Exception as e:
                     await message.reply(f"Failed For `{x}` → `{e}`")
             return
@@ -190,7 +278,6 @@ async def accept(client, message):
         )
 
         vj = await client.listen(message.chat.id)
-
         chat_ids = []
 
         if (
@@ -210,7 +297,6 @@ async def accept(client, message):
             return await message.reply("**❌ Invalid Input**")
 
         await vj.delete()
-
         msg = await show.edit("**Starting Approval…**")
 
         for chat_id in chat_ids:
@@ -219,13 +305,6 @@ async def accept(client, message):
     finally:
         if acc and acc.is_connected:
             await acc.disconnect()
-
-
-# ================= NON ADMIN ================= #
-
-@Client.on_message(filters.command("accept") & filters.private & ~filters.user(ADMINS))
-async def accept_non_admin(client, message):
-    await message.reply("**❌ You are not authorized to use this command.**")
 
 
 # ================= AUTO APPROVE ================= #
