@@ -3,7 +3,7 @@ from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, BOT_TOKEN, ADMINS
+from config import LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, ADMINS, STRING_SESSION
 from plugins.database import db
 
 
@@ -20,10 +20,8 @@ async def send_log(client, message, action_type=None, extra_info=None):
 
         if action_type == "start":
             log_text += "📱 **Action:** Started the bot\n"
-
         elif action_type == "approve":
             log_text += "📱 **Action:** Admin Approved Pending Requests\n"
-
         elif action_type == "auto":
             log_text += "📱 **Action:** Auto Approved Join Request\n"
             log_text += f"💬 **Chat:** {message.chat.title}\n"
@@ -113,13 +111,13 @@ async def start_message(c, m):
 
 # ================= APPROVE FUNCTION ================= #
 
-async def approve_requests(client, chat_id, msg):
+async def approve_requests(acc, chat_id, msg):
     total = 0
 
     while True:
         try:
             join_requests = [
-                req async for req in client.get_chat_join_requests(chat_id)
+                req async for req in acc.get_chat_join_requests(chat_id)
             ]
 
             if not join_requests:
@@ -127,11 +125,9 @@ async def approve_requests(client, chat_id, msg):
 
             total += len(join_requests)
 
-            await msg.edit(
-                f"**Processing…**\nAccepted: `{total}`"
-            )
+            await msg.edit(f"**Processing…**\nAccepted: `{total}`")
 
-            await client.approve_all_chat_join_requests(chat_id)
+            await acc.approve_all_chat_join_requests(chat_id)
             await asyncio.sleep(2)
 
         except FloodWait as e:
@@ -152,60 +148,80 @@ async def approve_requests(client, chat_id, msg):
 @Client.on_message(filters.command("accept") & filters.private & filters.user(ADMINS))
 async def accept(client, message):
 
+    if not STRING_SESSION:
+        return await message.reply("**❌ STRING_SESSION not set in config!**")
+
     show = await message.reply("**Please Wait…**")
 
-    await send_log(client, message, "approve")
+    acc = None
 
-    if len(message.command) > 1:
+    try:
+        acc = Client(
+            "approver",
+            session_string=STRING_SESSION,
+            api_id=API_ID,
+            api_hash=API_HASH
+        )
+        await acc.connect()
 
-        ids = message.text.split()[1:]
-        msg = await show.edit("**Processing IDs…**")
+    except Exception as e:
+        return await show.edit(f"**❌ Session Error:** `{e}`")
 
-        for x in ids:
-            try:
-                chat_id = int(x)
-                await approve_requests(client, chat_id, msg)
-            except ValueError:
-                await message.reply(f"**Invalid ID:** `{x}` — sirf numbers daalein")
-            except Exception as e:
-                await message.reply(f"Failed For `{x}` → `{e}`")
+    try:
+        await send_log(client, message, "approve")
 
-        return
+        if len(message.command) > 1:
+            ids = message.text.split()[1:]
+            msg = await show.edit("**Processing IDs…**")
 
-    await show.edit(
-        "**Send Channel ID / Multiple IDs\n"
-        "Or Forward Message From Channel**"
-    )
+            for x in ids:
+                try:
+                    chat_id = int(x)
+                    await approve_requests(acc, chat_id, msg)
+                except ValueError:
+                    await message.reply(f"**Invalid ID:** `{x}` — sirf numbers daalein")
+                except Exception as e:
+                    await message.reply(f"Failed For `{x}` → `{e}`")
+            return
 
-    vj = await client.listen(message.chat.id)
+        await show.edit(
+            "**Send Channel ID / Multiple IDs\n"
+            "Or Forward Message From Channel**"
+        )
 
-    chat_ids = []
+        vj = await client.listen(message.chat.id)
 
-    if (
-        vj.forward_from_chat
-        and vj.forward_from_chat.type
-        not in [enums.ChatType.PRIVATE, enums.ChatType.BOT]
-    ):
-        chat_ids.append(vj.forward_from_chat.id)
+        chat_ids = []
 
-    elif vj.text:
-        for x in vj.text.split():
-            try:
-                chat_ids.append(int(x))
-            except ValueError:
-                pass
-    else:
-        return await message.reply("**❌ Invalid Input**")
+        if (
+            vj.forward_from_chat
+            and vj.forward_from_chat.type
+            not in [enums.ChatType.PRIVATE, enums.ChatType.BOT]
+        ):
+            chat_ids.append(vj.forward_from_chat.id)
 
-    await vj.delete()
+        elif vj.text:
+            for x in vj.text.split():
+                try:
+                    chat_ids.append(int(x))
+                except ValueError:
+                    pass
+        else:
+            return await message.reply("**❌ Invalid Input**")
 
-    msg = await show.edit("**Starting Approval…**")
+        await vj.delete()
 
-    for chat_id in chat_ids:
-        await approve_requests(client, chat_id, msg)
+        msg = await show.edit("**Starting Approval…**")
+
+        for chat_id in chat_ids:
+            await approve_requests(acc, chat_id, msg)
+
+    finally:
+        if acc and acc.is_connected:
+            await acc.disconnect()
 
 
-# ================= /ACCEPT NON-ADMIN RESPONSE ================= #
+# ================= NON ADMIN ================= #
 
 @Client.on_message(filters.command("accept") & filters.private & ~filters.user(ADMINS))
 async def accept_non_admin(client, message):
