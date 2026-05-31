@@ -19,21 +19,22 @@ async def broadcast_messages(user_id, message):
         await asyncio.sleep(e.value)
         return await broadcast_messages(user_id, message)
     except InputUserDeactivated:
-        await db.delete_user(int(user_id))
         return "Deleted"
     except UserIsBlocked:
-        await db.delete_user(int(user_id))
         return "Blocked"
     except PeerIdInvalid:
-        await db.delete_user(int(user_id))
         return "Error"
     except Exception as e:
         logger.error(f"Error sending to {user_id}: {e}")
         return "Error"
 
 
-@Client.on_message(filters.command("broadcast") & filters.user(ADMINS) & filters.reply)
+@Client.on_message(filters.command("broadcast") & filters.private & filters.reply)
 async def broadcast_handler(bot, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
+
     users = await db.get_all_users()
     total_users = await db.total_users_count()
 
@@ -90,8 +91,12 @@ async def broadcast_handler(bot, message):
     )
 
 
-@Client.on_message(filters.command("stats") & filters.user(ADMINS))
+@Client.on_message(filters.command("stats") & filters.private)
 async def stats_handler(bot, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
+
     total_users = await db.total_users_count()
     await message.reply_text(
         f"📊 Bot Statistics\n\n"
@@ -99,8 +104,12 @@ async def stats_handler(bot, message):
     )
 
 
-@Client.on_message(filters.command("clean") & filters.user(ADMINS))
+@Client.on_message(filters.command("clean") & filters.private)
 async def clean_database(bot, message):
+
+    if message.from_user.id != ADMINS:
+        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
+
     users = await db.get_all_users()
     sts = await message.reply_text("🧹 Checking users...")
     removed = checked = 0
