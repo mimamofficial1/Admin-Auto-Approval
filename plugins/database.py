@@ -13,7 +13,6 @@ class Database:
         return dict(
             id=id,
             name=name,
-            session=None,
         )
 
     async def add_user(self, id, name):
@@ -34,18 +33,6 @@ class Database:
 
     async def delete_user(self, user_id):
         await self.col.delete_many({'id': int(user_id)})
-
-    async def set_session(self, id, session):
-        await self.col.update_one(
-            {'id': int(id)},
-            {'$set': {'session': session}}
-        )
-
-    async def get_session(self, id):
-        user = await self.col.find_one({'id': int(id)})
-        if user:
-            return user.get('session')
-        return None
 
 
 db = Database(DB_URI, DB_NAME)
