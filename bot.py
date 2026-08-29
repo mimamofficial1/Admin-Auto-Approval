@@ -4,6 +4,7 @@ from aiohttp import web
 
 from pyrogram import Client
 from config import API_ID, API_HASH, BOT_TOKEN
+from plugins.scheduler import auto_accept_loop, session_health_loop
 
 
 # 🌐 Auto PORT detect (Koyeb / Heroku)
@@ -30,6 +31,11 @@ class Bot(Client):
         self.username = '@' + me.username
 
         print('Bot Started Powered By @VJ_Botz')
+
+        # 🔁 Background jobs: auto-accept scan for session-based saved
+        # channels, and periodic session health checks
+        asyncio.create_task(auto_accept_loop(self))
+        asyncio.create_task(session_health_loop(self))
 
         # ✅ Web server start for health check
         await self.start_web_server()
