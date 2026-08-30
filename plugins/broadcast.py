@@ -91,19 +91,6 @@ async def broadcast_handler(bot, message):
     )
 
 
-@Client.on_message(filters.command("stats") & filters.private)
-async def stats_handler(bot, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
-
-    total_users = await db.total_users_count()
-    await message.reply_text(
-        f"📊 Bot Statistics\n\n"
-        f"👥 Total Users In Database: {total_users}\n"
-    )
-
-
 @Client.on_message(filters.command("clean") & filters.private)
 async def clean_database(bot, message):
 
