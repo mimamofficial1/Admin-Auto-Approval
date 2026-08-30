@@ -834,49 +834,7 @@ async def on_bot_promoted_to_admin(client, update):
         print(f"AUTO ACCEPT ON PROMOTION ERROR: {e}")
 
 
-# ================= AUTO APPROVE (flood-safe + suspicious filter + per-channel toggle) ================= #
-
-_debounce_tasks = {}
-BATCH_WINDOW = 3  # seconds - collect a short burst into ONE bulk approve call
-
-
-async def _debounced_bulk_approve(client, chat_id):
-    """Runs BATCH_WINDOW seconds after the first request in a burst comes
-    in, then approves whatever piled up - reuses approve_requests() so
-    it gets the same loop-until-actually-zero fix (a single
-    approve_all_chat_join_requests call only clears ~100 at a time on
-    Telegram's end, so a big sudden burst needs the same looping, not
-    just /accept)."""
-    await asyncio.sleep(BATCH_WINDOW)
-    try:
-        _cid, count, err = await approve_requests(client, chat_id)
-        if err is None and count:
-            await db.increment_stats(chat_id, count)
-    except Exception as e:
-        print(f"BATCH APPROVE ERROR ({chat_id}): {e}")
-    finally:
-        _debounce_tasks.pop(chat_id, None)
-
-
-def _schedule_bulk_approve(client, chat_id):
-    task = _debounce_tasks.get(chat_id)
-    if task and not task.done():
-        return  # a window is already running - this request rides along with it
-    _debounce_tasks[chat_id] = asyncio.create_task(_debounced_bulk_approve(client, chat_id))
-
-
-async def _looks_suspicious(client, user_id):
-    """Very lightweight spam/fake-account heuristic: no profile photo at
-    all. Not perfect, but catches the bulk of throwaway spam accounts
-    without ever blocking a real user's request permanently - it's only
-    held for a manual /approveuser or /rejectuser by an admin."""
-    try:
-        async for _photo in client.get_chat_photos(user_id, limit=1):
-            return False
-        return True
-    except Exception:
-        return False  # API hiccup - never punish a real user for that
-
+# ================= AUTO APPROVE (instant, per-channel toggle) ================= #
 
 @Client.on_chat_join_request(filters.group | filters.channel)
 async def auto_approve(client, m):
@@ -893,22 +851,11 @@ async def auto_approve(client, m):
         if not await db.is_user_exist(m.from_user.id):
             await db.add_user(m.from_user.id, m.from_user.first_name)
 
-        if await _looks_suspicious(client, m.from_user.id):
-            try:
-                await client.send_message(
-                    LOG_CHANNEL,
-                    "⚠️ **Suspicious Join Request Held For Review**\n"
-                    f"👤 {m.from_user.mention} (`{m.from_user.id}`)\n"
-                    f"💬 {m.chat.title} (`{m.chat.id}`)\n"
-                    "Reason: no profile photo.\n\n"
-                    f"✅ `/approveuser {m.chat.id} {m.from_user.id}`\n"
-                    f"❌ `/rejectuser {m.chat.id} {m.from_user.id}`"
-                )
-            except Exception:
-                pass
-            return
-
-        _schedule_bulk_approve(client, m.chat.id)
+        await client.approve_chat_join_request(
+            chat_id=m.chat.id,
+            user_id=m.from_user.id
+        )
+        await db.increment_stats(m.chat.id, 1)
         await send_log(client, m, "auto")
 
         try:
@@ -923,6 +870,17 @@ async def auto_approve(client, m):
             )
         except Exception:
             pass
+
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
+        try:
+            await client.approve_chat_join_request(
+                chat_id=m.chat.id,
+                user_id=m.from_user.id
+            )
+            await db.increment_stats(m.chat.id, 1)
+        except Exception as e:
+            print(f"AUTO APPROVE RETRY ERROR: {e}")
 
     except Exception as e:
         print(f"AUTO APPROVE ERROR: {e}")
