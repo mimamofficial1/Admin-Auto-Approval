@@ -556,55 +556,72 @@ async def _pending_count(acc, chat_id):
 
 
 async def approve_requests(acc, chat_id):
-    """Approves ALL pending join requests in one chat - ULTRA FAST.
+    """Approves ALL pending join requests in one chat - loops until it's
+    REALLY zero.
 
-    Only 2 network calls total, no matter how many thousand requests are
-    pending:
-      1. _pending_count() - one call to read the total via Telegram's
-         `count` field (no pagination).
-      2. approve_all_chat_join_requests() - one bulk call that approves
-         everyone server-side.
+    REAL BUG FOUND: Telegram's own bulk-approve API
+    (approve_all_chat_join_requests, raw: hideAllChatJoinRequests) does
+    NOT clear a big channel in one shot - it silently approves only one
+    internal batch (~100 requests) per call and quietly leaves the rest
+    pending. That's exactly why running /accept several times in a row
+    showed the count SLOWLY SHRINKING instead of going to 0
+    (e.g. 7121 -> 7021 -> 6921) - each run was only clearing one more
+    batch, not everything. This was never a counting/math bug - the
+    count was accurate the whole time, the approve call itself just
+    wasn't finishing the job.
 
-    History of this function:
-    1. Old version had an artificial `asyncio.sleep(2)` between passes -
-       removed, that alone made it feel slow for no reason.
-    2. Returns (chat_id, count, error) instead of editing a shared message
-       directly - avoids the old bug where multi-channel runs only kept
-       the LAST channel's count instead of a real grand total.
-    3. COUNT BUG: a 5-pass re-fetch-and-reapprove loop used to double
-       count requests because Telegram can still show just-approved
-       requests as pending for a brief moment (eventual consistency) -
-       removed in favor of one clean fetch + one approve.
-    4. SPEED: replaced the full page-by-page pending fetch (which alone
-       could take dozens of round-trips for a big channel) with the
-       single-call `count` peek above - this is the main speed win.
+    Fix: keep calling approve_all_chat_join_requests and re-checking the
+    real remaining count (via the fast single-call _pending_count) until
+    it actually hits 0 (or genuinely stops shrinking / a safety cap is
+    hit). One /accept now clears everything in one go, no matter how
+    many times you'd have needed to spam it before.
     """
     try:
-        total = await _pending_count(acc, chat_id)
+        before = await _pending_count(acc, chat_id)
     except FloodWait as e:
         await asyncio.sleep(e.value)
         try:
-            total = await _pending_count(acc, chat_id)
+            before = await _pending_count(acc, chat_id)
         except Exception as e:
             return chat_id, 0, str(e)
     except Exception as e:
         return chat_id, 0, str(e)
 
-    if total == 0:
+    if before == 0:
         return chat_id, 0, None
 
-    try:
-        await acc.approve_all_chat_join_requests(chat_id)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
+    remaining = before
+    rounds = 0
+    MAX_ROUNDS = 500  # safety cap - each round clears a batch, so this covers even huge queues
+
+    while remaining > 0 and rounds < MAX_ROUNDS:
         try:
             await acc.approve_all_chat_join_requests(chat_id)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            continue
         except Exception as e:
-            return chat_id, 0, str(e)
-    except Exception as e:
-        return chat_id, 0, str(e)
+            approved_so_far = before - remaining
+            return chat_id, approved_so_far, (str(e) if approved_so_far == 0 else None)
 
-    return chat_id, total, None
+        rounds += 1
+
+        try:
+            new_remaining = await _pending_count(acc, chat_id)
+        except FloodWait as e:
+            await asyncio.sleep(e.value)
+            try:
+                new_remaining = await _pending_count(acc, chat_id)
+            except Exception:
+                break  # can't verify anymore - stop with what we've confirmed so far
+        except Exception:
+            break
+
+        if new_remaining >= remaining:
+            break  # not shrinking anymore - avoid looping forever
+        remaining = new_remaining
+
+    return chat_id, before - remaining, None
 
 
 def _format_progress(results, done, expected):
@@ -800,22 +817,16 @@ BATCH_WINDOW = 3  # seconds - collect a short burst into ONE bulk approve call
 
 async def _debounced_bulk_approve(client, chat_id):
     """Runs BATCH_WINDOW seconds after the first request in a burst comes
-    in, then approves whatever piled up with a SINGLE API call instead of
-    one call per user - this is what keeps the bot from tripping FloodWait
-    when a channel suddenly gets hit with many requests at once."""
+    in, then approves whatever piled up - reuses approve_requests() so
+    it gets the same loop-until-actually-zero fix (a single
+    approve_all_chat_join_requests call only clears ~100 at a time on
+    Telegram's end, so a big sudden burst needs the same looping, not
+    just /accept)."""
     await asyncio.sleep(BATCH_WINDOW)
     try:
-        pending = [r async for r in client.get_chat_join_requests(chat_id)]
-        count = len(pending)
-        if count:
-            await client.approve_all_chat_join_requests(chat_id)
+        _cid, count, err = await approve_requests(client, chat_id)
+        if err is None and count:
             await db.increment_stats(chat_id, count)
-    except FloodWait as e:
-        await asyncio.sleep(e.value)
-        try:
-            await client.approve_all_chat_join_requests(chat_id)
-        except Exception as e:
-            print(f"BATCH APPROVE RETRY ERROR ({chat_id}): {e}")
     except Exception as e:
         print(f"BATCH APPROVE ERROR ({chat_id}): {e}")
     finally:
