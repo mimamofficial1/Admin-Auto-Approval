@@ -15,3 +15,10 @@ DB_NAME = environ.get("DB_NAME", "mohammadmuzaffarimambaturbari")
 
 # If this is True Then Bot Accept New Join Request
 NEW_REQ_MODE = bool(environ.get('NEW_REQ_MODE', True))
+
+# ===== AI SUPPORT CHATBOT (Google Gemini) =====
+# Free API key yahan se lo: https://aistudio.google.com/apikey
+# Agar yeh empty rahega, AI chatbot feature silently OFF rahega - baaki
+# bot ka kaam normal chalta rahega.
+GEMINI_API_KEY = environ.get("GEMINI_API_KEY", "")
+GEMINI_MODEL = environ.get("GEMINI_MODEL", "gemini-3.5-flash-lite")
