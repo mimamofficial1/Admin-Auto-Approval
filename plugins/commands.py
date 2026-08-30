@@ -5,6 +5,7 @@ from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, ADMINS, STRING_SESSION
 from plugins.database import db
+from pyrogram import raw
 
 
 # ================= ADMIN CHECK ================= #
@@ -534,43 +535,74 @@ async def admins_list(client, message):
 
 # ================= APPROVE FUNCTION ================= #
 
+async def _pending_count(acc, chat_id):
+    """Gets the TOTAL pending join-request count in a SINGLE API call,
+    instead of paging through every request one-by-one like
+    get_chat_join_requests() does. Telegram's raw response already
+    includes a `count` field for the full match - we just read it with
+    limit=1. For a channel with thousands of pending requests this turns
+    what used to be dozens of sequential network round-trips into one,
+    which is what actually made /accept feel slow before."""
+    r = await acc.invoke(
+        raw.functions.messages.GetChatInviteImporters(
+            peer=await acc.resolve_peer(chat_id),
+            requested=True,
+            offset_date=0,
+            offset_user=raw.types.InputUserEmpty(),
+            limit=1,
+        )
+    )
+    return r.count
+
+
 async def approve_requests(acc, chat_id):
-    """Approves ALL pending join requests in one chat, fast.
+    """Approves ALL pending join requests in one chat - ULTRA FAST.
 
-    Fixes 2 bugs from before:
-    1. No artificial `asyncio.sleep(2)` between passes anymore - that was
-       the main reason it felt slow, since it slept even when there was
-       nothing left to do.
+    Only 2 network calls total, no matter how many thousand requests are
+    pending:
+      1. _pending_count() - one call to read the total via Telegram's
+         `count` field (no pagination).
+      2. approve_all_chat_join_requests() - one bulk call that approves
+         everyone server-side.
+
+    History of this function:
+    1. Old version had an artificial `asyncio.sleep(2)` between passes -
+       removed, that alone made it feel slow for no reason.
     2. Returns (chat_id, count, error) instead of editing a shared message
-       directly - the old code reset `total = 0` for every chat_id and
-       overwrote the same message, so with multiple channels the final
-       count only reflected the LAST channel, never the real grand total.
+       directly - avoids the old bug where multi-channel runs only kept
+       the LAST channel's count instead of a real grand total.
+    3. COUNT BUG: a 5-pass re-fetch-and-reapprove loop used to double
+       count requests because Telegram can still show just-approved
+       requests as pending for a brief moment (eventual consistency) -
+       removed in favor of one clean fetch + one approve.
+    4. SPEED: replaced the full page-by-page pending fetch (which alone
+       could take dozens of round-trips for a big channel) with the
+       single-call `count` peek above - this is the main speed win.
     """
-    total = 0
-    passes = 0
-
-    while passes < 5:  # safety cap - handles new requests trickling in mid-run
+    try:
+        total = await _pending_count(acc, chat_id)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
         try:
-            pending = [r async for r in acc.get_chat_join_requests(chat_id)]
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            continue
+            total = await _pending_count(acc, chat_id)
         except Exception as e:
-            return chat_id, total, str(e)
+            return chat_id, 0, str(e)
+    except Exception as e:
+        return chat_id, 0, str(e)
 
-        if not pending:
-            break
+    if total == 0:
+        return chat_id, 0, None
 
+    try:
+        await acc.approve_all_chat_join_requests(chat_id)
+    except FloodWait as e:
+        await asyncio.sleep(e.value)
         try:
             await acc.approve_all_chat_join_requests(chat_id)
-        except FloodWait as e:
-            await asyncio.sleep(e.value)
-            continue
         except Exception as e:
-            return chat_id, total, str(e)
-
-        total += len(pending)
-        passes += 1
+            return chat_id, 0, str(e)
+    except Exception as e:
+        return chat_id, 0, str(e)
 
     return chat_id, total, None
 
@@ -701,6 +733,63 @@ async def accept(client, message):
     finally:
         if acc and acc.is_connected:
             await acc.disconnect()
+
+
+# ================= AUTO ACCEPT ON BOT PROMOTED TO ADMIN ================= #
+# Restores the old behaviour: jaise hi bot ko kisi channel/group me ADMIN
+# banaya jata hai (aur wo pehle admin nahi tha), turant us chat ke saare
+# already-pending join requests bhi accept ho jaate hain - bina /accept
+# command chalaye. (Naye join requests to on_chat_join_request se already
+# live handle hote hain - yeh sirf ADMIN-banate-hi-ke-purane-pending wala
+# case cover karta hai.)
+
+@Client.on_chat_member_updated()
+async def on_bot_promoted_to_admin(client, update):
+
+    me = await client.get_me()
+    if not update.new_chat_member or update.new_chat_member.user.id != me.id:
+        return  # yeh update kisi aur member ka hai, bot ka nahi
+
+    new_status = update.new_chat_member.status
+    old_status = update.old_chat_member.status if update.old_chat_member else None
+
+    if new_status != enums.ChatMemberStatus.ADMINISTRATOR:
+        return  # admin nahi bana
+    if old_status == enums.ChatMemberStatus.ADMINISTRATOR:
+        return  # pehle se hi admin tha (rights update hua bas) - skip
+
+    # Agar "invite users" right nahi mila to join requests approve nahi ho
+    # payengi - koshish hi mat karo, chup chap skip.
+    privileges = update.new_chat_member.privileges
+    if privileges and not privileges.can_invite_users:
+        return
+
+    chat_id, count, err = await approve_requests(client, update.chat.id)
+    if err or not count:
+        return
+
+    await db.increment_stats(chat_id, count)
+
+    try:
+        await client.send_message(
+            chat_id,
+            "✅ **Admin Bana Diya Gaya!**\n\n"
+            f"🔁 `{count}` pehle se pending join request(s) turant accept kar diye gaye."
+        )
+    except Exception:
+        pass
+
+    try:
+        await client.send_message(
+            LOG_CHANNEL,
+            "📝 **New Bot Activity**\n"
+            "📱 **Action:** Bot Promoted To Admin → Auto Accepted Pending Requests\n"
+            f"💬 **Chat:** {update.chat.title}\n"
+            f"🆔 **Chat ID:** `{update.chat.id}`\n"
+            f"✅ **Accepted:** `{count}`"
+        )
+    except Exception:
+        pass
 
 
 # ================= AUTO APPROVE (flood-safe + suspicious filter + per-channel toggle) ================= #
