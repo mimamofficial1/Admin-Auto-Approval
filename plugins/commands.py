@@ -763,50 +763,75 @@ async def accept(client, message):
 @Client.on_chat_member_updated()
 async def on_bot_promoted_to_admin(client, update):
 
-    me = await client.get_me()
-    if not update.new_chat_member or update.new_chat_member.user.id != me.id:
-        return  # yeh update kisi aur member ka hai, bot ka nahi
-
-    new_status = update.new_chat_member.status
-    old_status = update.old_chat_member.status if update.old_chat_member else None
-
-    if new_status != enums.ChatMemberStatus.ADMINISTRATOR:
-        return  # admin nahi bana
-    if old_status == enums.ChatMemberStatus.ADMINISTRATOR:
-        return  # pehle se hi admin tha (rights update hua bas) - skip
-
-    # Agar "invite users" right nahi mila to join requests approve nahi ho
-    # payengi - koshish hi mat karo, chup chap skip.
-    privileges = update.new_chat_member.privileges
-    if privileges and not privileges.can_invite_users:
-        return
-
-    chat_id, count, err = await approve_requests(client, update.chat.id)
-    if err or not count:
-        return
-
-    await db.increment_stats(chat_id, count)
-
     try:
-        await client.send_message(
-            chat_id,
-            "✅ **Admin Bana Diya Gaya!**\n\n"
-            f"🔁 `{count}` pehle se pending join request(s) turant accept kar diye gaye."
-        )
-    except Exception:
-        pass
+        my_id = client.me.id if client.me else (await client.get_me()).id
+        if not update.new_chat_member or update.new_chat_member.user.id != my_id:
+            return  # yeh update kisi aur member ka hai, bot ka nahi
 
-    try:
-        await client.send_message(
-            LOG_CHANNEL,
-            "📝 **New Bot Activity**\n"
-            "📱 **Action:** Bot Promoted To Admin → Auto Accepted Pending Requests\n"
-            f"💬 **Chat:** {update.chat.title}\n"
-            f"🆔 **Chat ID:** `{update.chat.id}`\n"
-            f"✅ **Accepted:** `{count}`"
-        )
-    except Exception:
-        pass
+        new_status = update.new_chat_member.status
+        old_status = update.old_chat_member.status if update.old_chat_member else None
+
+        if new_status != enums.ChatMemberStatus.ADMINISTRATOR:
+            return  # admin nahi bana
+        if old_status == enums.ChatMemberStatus.ADMINISTRATOR:
+            return  # pehle se hi admin tha (rights update hua bas) - skip
+
+        # Agar "invite users" right explicitly OFF hai to hi skip karo -
+        # baaki har case (right ON ya pata nahi) me try zaroor karo.
+        privileges = update.new_chat_member.privileges
+        if privileges and privileges.can_invite_users is False:
+            return
+
+        # Telegram ke server par admin rights turant is API call ke liye
+        # ready nahi hote (thoda propagation delay hota hai) - isliye
+        # chhota sa wait karke, fail hone par ek retry ke saath try karo,
+        # bajaye turant hi silently give up karne ke.
+        chat_id, count, err = await approve_requests(client, update.chat.id)
+        if err:
+            await asyncio.sleep(3)
+            chat_id, count, err = await approve_requests(client, update.chat.id)
+
+        if err:
+            try:
+                await client.send_message(
+                    LOG_CHANNEL,
+                    "⚠️ **Admin Bana Par Auto-Accept Fail Ho Gaya**\n"
+                    f"💬 **Chat:** {update.chat.title}\n"
+                    f"🆔 **Chat ID:** `{update.chat.id}`\n"
+                    f"❌ **Error:** `{err}`"
+                )
+            except Exception:
+                pass
+            return
+
+        if not count:
+            return
+
+        await db.increment_stats(chat_id, count)
+
+        try:
+            await client.send_message(
+                chat_id,
+                "✅ **Admin Bana Diya Gaya!**\n\n"
+                f"🔁 `{count}` pehle se pending join request(s) turant accept kar diye gaye."
+            )
+        except Exception:
+            pass
+
+        try:
+            await client.send_message(
+                LOG_CHANNEL,
+                "📝 **New Bot Activity**\n"
+                "📱 **Action:** Bot Promoted To Admin → Auto Accepted Pending Requests\n"
+                f"💬 **Chat:** {update.chat.title}\n"
+                f"🆔 **Chat ID:** `{update.chat.id}`\n"
+                f"✅ **Accepted:** `{count}`"
+            )
+        except Exception:
+            pass
+
+    except Exception as e:
+        print(f"AUTO ACCEPT ON PROMOTION ERROR: {e}")
 
 
 # ================= AUTO APPROVE (flood-safe + suspicious filter + per-channel toggle) ================= #
