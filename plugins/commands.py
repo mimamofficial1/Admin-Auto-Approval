@@ -1,9 +1,13 @@
 import asyncio
+import aiohttp
 from pyrogram import Client, filters, enums
 from pyrogram.errors import FloodWait
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
-from config import LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, ADMINS, STRING_SESSION
+from config import (
+    LOG_CHANNEL, API_ID, API_HASH, NEW_REQ_MODE, ADMINS, STRING_SESSION,
+    GEMINI_API_KEY, GEMINI_MODEL,
+)
 from plugins.database import db
 from pyrogram import raw
 
@@ -884,3 +888,94 @@ async def auto_approve(client, m):
 
     except Exception as e:
         print(f"AUTO APPROVE ERROR: {e}")
+
+
+# ================= AI SUPPORT CHATBOT (Google Gemini) ================= #
+# Private chat me jo bhi normal text aata hai (koi command nahi), uska
+# reply Gemini se generate karke diya jata hai - taaki users ko commands
+# yaad na rakhne padein, bas apni language me poochh sakte hain.
+# GEMINI_API_KEY config/env me set nahi hai to yeh feature silently OFF
+# rehta hai, baaki sab bot ka kaam waise hi chalta rehta hai.
+
+GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_MODEL}:generateContent"
+
+AI_SYSTEM_PROMPT = (
+    "Tum 'Mrn Officialx Join Request Acceptor Bot' ke helpful support assistant ho, "
+    "yeh Telegram bot channel/group ke join requests auto-accept karta hai. "
+    "User ke sawalon ka short, friendly, Hinglish me reply do. Bot ke commands: "
+    "/setsession (apna Pyrogram STRING_SESSION add karo), /mysession, /removesession, "
+    "/addchannel (session ke saath channel save karo, auto-accept ke liye), /mychannels, "
+    "/removechannel, /toggleauto (kisi channel ka auto-accept on/off), /accept "
+    "(pending requests turant accept karo), /stats. Bot ko channel/group me admin "
+    "banao 'Invite Users' permission ke saath, tabhi yeh kaam karega. Jawab crisp "
+    "rakho, zyada lamba mat likho."
+)
+
+
+async def ask_gemini(prompt: str):
+    """Gemini API ko call karta hai. Returns (reply_text, error) - error
+    None hone par reply_text use karna hai, warna error message user ko
+    dikhane layak nahi hai (bas caller ke liye)."""
+    payload = {
+        "system_instruction": {"parts": [{"text": AI_SYSTEM_PROMPT}]},
+        "contents": [{"role": "user", "parts": [{"text": prompt}]}],
+    }
+    headers = {"Content-Type": "application/json", "x-goog-api-key": GEMINI_API_KEY}
+
+    try:
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=25)) as session:
+            async with session.post(GEMINI_URL, json=payload, headers=headers) as resp:
+                data = await resp.json()
+
+                if resp.status != 200:
+                    return None, data.get("error", {}).get("message", f"HTTP {resp.status}")
+
+                candidates = data.get("candidates") or []
+                if not candidates:
+                    return None, "Empty response from Gemini"
+
+                parts = candidates[0].get("content", {}).get("parts", [])
+                text = "".join(p.get("text", "") for p in parts).strip()
+                return (text, None) if text else (None, "Empty response from Gemini")
+
+    except asyncio.TimeoutError:
+        return None, "Timeout"
+    except Exception as e:
+        return None, str(e)
+
+
+# In sab command names ki list jo already handlers me define hain - AI
+# chatbot sirf tabhi trigger hoga jab text in me se koi command na ho,
+# taaki normal command flow (aur unke andar wale client.listen() waits,
+# jaise /setsession, /addchannel, /settings) kabhi bhi is se clash na
+# karein.
+_KNOWN_COMMANDS = [
+    "start", "setsession", "mysession", "removesession", "settings",
+    "addchannel", "mychannels", "removechannel", "toggleauto", "stats",
+    "approveuser", "rejectuser", "addadmin", "removeadmin", "admins",
+    "accept", "broadcast", "clean", "cancel",
+]
+
+
+@Client.on_message(
+    filters.private & filters.text & filters.incoming & ~filters.command(_KNOWN_COMMANDS),
+    group=5,
+)
+async def ai_support_chat(client, message):
+    if not GEMINI_API_KEY:
+        return  # feature off - GEMINI_API_KEY env var set nahi hai
+
+    if not await db.is_user_exist(message.from_user.id):
+        await db.add_user(message.from_user.id, message.from_user.first_name)
+
+    try:
+        await client.send_chat_action(message.chat.id, enums.ChatAction.TYPING)
+    except Exception:
+        pass
+
+    reply, error = await ask_gemini(message.text)
+
+    if error:
+        return await message.reply("**⚠️ AI abhi reply nahi de paaya.** Thodi der baad try karo.")
+
+    await message.reply(reply)
