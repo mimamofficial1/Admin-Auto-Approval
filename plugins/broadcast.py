@@ -29,20 +29,18 @@ async def broadcast_messages(user_id, message):
         return "Error"
 
 
-@Client.on_message(filters.command("broadcast") & filters.private & filters.reply)
-async def broadcast_handler(bot, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
-
+async def run_broadcast(bot, admin_message, b_msg):
+    """Core broadcast loop - takes the message to copy out (b_msg) and
+    reports progress into admin_message. Called from the button-menu
+    handler in commands.py (button ke through 'send me the message to
+    broadcast' poochh ke yeh function call hota hai)."""
     users = await db.get_all_users()
     total_users = await db.total_users_count()
 
     if total_users == 0:
-        return await message.reply_text("❌ No users in database.")
+        return await admin_message.reply_text("❌ No users in database.")
 
-    b_msg = message.reply_to_message
-    sts = await message.reply_text("🚀 Broadcast Started...")
+    sts = await admin_message.reply_text("🚀 Broadcast Started...")
     start_time = time.time()
 
     done = success = blocked = deleted = failed = 0
@@ -91,14 +89,10 @@ async def broadcast_handler(bot, message):
     )
 
 
-@Client.on_message(filters.command("clean") & filters.private)
-async def clean_database(bot, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply("🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai.")
-
+async def run_clean(bot, admin_message):
+    """Core DB-cleanup loop, called from the button-menu handler."""
     users = await db.get_all_users()
-    sts = await message.reply_text("🧹 Checking users...")
+    sts = await admin_message.reply_text("🧹 Checking users...")
     removed = checked = 0
 
     async for user in users:
