@@ -1,7 +1,10 @@
 import asyncio
 import aiohttp
 from pyrogram import Client, filters, enums
-from pyrogram.errors import FloodWait
+from pyrogram.errors import (
+    FloodWait, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
+    SessionPasswordNeeded, PasswordHashInvalid,
+)
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
 from config import (
@@ -9,6 +12,7 @@ from config import (
     GEMINI_API_KEY, GEMINI_MODEL,
 )
 from plugins.database import db
+from plugins.broadcast import run_broadcast, run_clean
 from pyrogram import raw
 
 
@@ -24,7 +28,7 @@ async def is_authorized(user_id):
 # Priority: 1) user's own self-added session (works for EVERYONE, no
 # admin needed - fixes "Access Denied" for normal users)
 #           2) authorized admin/owner -> falls back to the global session
-#              set via /settings (or config.py as last resort)
+#              set via Global Session panel (or config.py as last resort)
 
 async def get_session_for(user_id):
     personal = await db.get_session(user_id)
@@ -100,7 +104,6 @@ async def send_log(client, message, action_type=None, extra_info=None):
     except Exception as e:
         print(f"LOG ERROR: {e}")
 
-
 # ================= START ================= #
 
 @Client.on_message(filters.command("start"))
@@ -118,7 +121,7 @@ async def start_message(c, m):
 <blockquote>📌 How To Get Started:</blockquote>
 <blockquote>➊ Add me to your Channel or Group</blockquote>
 <blockquote>➋ Give Admin Rights (Invite Users Permission)</blockquote>
-<blockquote>➌ Use /accept to approve requests</blockquote></b>
+<blockquote>➌ Tap 🛠 Open Menu neeche, sab kuch buttons se ho jaayega</blockquote></b>
 """
 
     await m.reply_photo(
@@ -127,6 +130,7 @@ async def start_message(c, m):
         parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             [
+                [InlineKeyboardButton("🛠 Open Menu", callback_data="menu:main")],
                 [
                     InlineKeyboardButton(
                         "➕ Add Me To Your Channel",
@@ -158,87 +162,330 @@ async def start_message(c, m):
     )
 
 
-# ================= SELF-SERVICE SESSION (ANY USER - NO ADMIN NEEDED) ================= #
+# ============================================================================
+# ==================== BUTTON MENU (replaces typed commands) ================
+# ============================================================================
+# Sab feature (login, session, channels, stats, admin tools) ab is menu ke
+# buttons se hi chalte hain. Jahan text/number/session-string input zaroori
+# hai (phone, OTP, channel ID, user ID waghera), wahan bot poochta hai aur
+# client.listen() se agla message wait karta hai - bilkul waisa hi jaisa
+# pehle /setsession, /addchannel me tha, bas ab typing ki jagah button dabane
+# se shuru hota hai. Cancel karne ke liye hamesha /cancel bhejo.
 
-@Client.on_message(filters.command("setsession") & filters.private)
-async def set_session_cmd(client, message):
+MENU_TEXT = "🛠 <b>Menu</b>\n\nNeeche se koi option choose karo:"
 
-    name = 'default'
-    session_string = None
 
-    if len(message.command) > 1:
-        arg = message.text.split(None, 1)[1].strip()
-        if len(arg) > 50:          # looks like an actual session string
-            session_string = arg
-        else:                      # looks like a short name, e.g. "backup"
-            name = arg
+def main_menu_markup(user_id) -> InlineKeyboardMarkup:
+    rows = [
+        [InlineKeyboardButton("🔑 Login", callback_data="menu:login"),
+         InlineKeyboardButton("📤 Add Session", callback_data="menu:addsession")],
+        [InlineKeyboardButton("📋 My Sessions", callback_data="menu:mysessions"),
+         InlineKeyboardButton("🗑 Remove Session", callback_data="menu:removesession")],
+        [InlineKeyboardButton("➕ Add Channel", callback_data="menu:addchannel"),
+         InlineKeyboardButton("📂 My Channels", callback_data="menu:mychannels")],
+        [InlineKeyboardButton("📊 Stats", callback_data="menu:stats"),
+         InlineKeyboardButton("⚡ Accept Pending", callback_data="menu:accept")],
+    ]
+    rows.append([InlineKeyboardButton("👑 Admin Panel", callback_data="menu:admin")])
+    rows.append([InlineKeyboardButton("❌ Close", callback_data="menu:close")])
+    return InlineKeyboardMarkup(rows)
 
-    target_msg = message
-    if not session_string:
-        ask = await message.reply(
-            f"**📤 Apna Pyrogram STRING_SESSION bhejo** (session name: `{name}`).\n\n"
-            "⚠️ Yeh sirf tumhare account tak limited rahega, kisi aur ko nahi dikhega.\n"
-            "Cancel karne ke liye /cancel bhejo."
-        )
+
+def admin_menu_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✅ Approve User", callback_data="menu:approveuser"),
+         InlineKeyboardButton("❌ Reject User", callback_data="menu:rejectuser")],
+        [InlineKeyboardButton("👑 Manage Admins", callback_data="menu:manageadmins")],
+        [InlineKeyboardButton("📢 Broadcast", callback_data="menu:broadcast"),
+         InlineKeyboardButton("🧹 Clean DB", callback_data="menu:clean")],
+        [InlineKeyboardButton("🌐 Global Session", callback_data="menu:globalsession")],
+        [InlineKeyboardButton("🔙 Back", callback_data="menu:main")],
+    ])
+
+
+def manage_admins_markup() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Add Admin", callback_data="menu:addadmin"),
+         InlineKeyboardButton("🗑 Remove Admin", callback_data="menu:removeadmin")],
+        [InlineKeyboardButton("📋 Admins List", callback_data="menu:admins")],
+        [InlineKeyboardButton("🔙 Back", callback_data="menu:admin")],
+    ])
+
+
+async def _listen_text(client, chat_id, prompt, entry, timeout=300):
+    """Common helper: ask a question, wait for the next text reply. Returns
+    the response Message, or None (and already replies to the user) if it
+    timed out / was cancelled / wasn't text."""
+    ask = await entry.reply(f"{prompt}\n\nCancel karne ke liye /cancel bhejo.")
+    try:
+        resp = await client.listen(chat_id, timeout=timeout)
+    except asyncio.TimeoutError:
+        await ask.edit("⏰ **Time khatam ho gaya.** Menu se dobara try karo.")
+        return None
+    if resp.text and resp.text.strip().lower() == "/cancel":
+        await resp.reply("❌ Cancelled.")
+        return None
+    return resp
+
+
+@Client.on_callback_query(filters.regex(r"^menu:(.+)$"))
+async def cb_menu_router(client, query):
+    user_id = query.from_user.id
+    chat_id = query.message.chat.id
+    entry = query.message
+    key = query.matches[0].group(1)
+
+    # ---- plain navigation (no access check needed) ----
+    if key == "main":
+        await query.answer()
+        return await entry.edit(MENU_TEXT, parse_mode=enums.ParseMode.HTML, reply_markup=main_menu_markup(user_id))
+
+    if key == "close":
+        await query.answer()
         try:
-            resp = await client.listen(message.chat.id, timeout=300)
+            await entry.delete()
+        except Exception:
+            pass
+        return
+
+    # ---- admin-gated navigation ----
+    if key == "admin":
+        if not await is_authorized(user_id):
+            return await query.answer("🚫 Sirf admin/owner ke liye.", show_alert=True)
+        await query.answer()
+        return await entry.edit("👑 <b>Admin Panel</b>", parse_mode=enums.ParseMode.HTML, reply_markup=admin_menu_markup())
+
+    if key == "manageadmins":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await entry.edit("👑 <b>Manage Admins</b>", parse_mode=enums.ParseMode.HTML, reply_markup=manage_admins_markup())
+
+    if key == "globalsession":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await render_settings(entry, edit=True)
+
+    # ---- session actions ----
+    if key == "login":
+        await query.answer()
+        return await _do_login(client, chat_id, user_id, entry)
+
+    if key == "addsession":
+        await query.answer()
+        return await _do_addsession(client, chat_id, user_id, entry)
+
+    if key == "mysessions":
+        await query.answer()
+        sessions = await db.get_all_sessions(user_id)
+        if not sessions:
+            text = "**❌ Koi session set nahi hai.**\nAdd karne ke liye 🔑 Login ya 📤 Add Session use karo."
+        else:
+            lines = "\n".join(f"• `{name}`" for name in sessions)
+            text = f"**✅ Tumhare saved sessions:**\n\n{lines}"
+        return await entry.reply(text)
+
+    if key == "removesession":
+        await query.answer()
+        sessions = await db.get_all_sessions(user_id)
+        if not sessions:
+            return await entry.reply("**❌ Koi session set nahi hai.**")
+        rows = [[InlineKeyboardButton(f"🗑 {name}", callback_data=f"sessrm:{name}")] for name in sessions]
+        rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:main")])
+        return await entry.reply("**Kaunsa session remove karna hai?**", reply_markup=InlineKeyboardMarkup(rows))
+
+    # ---- channel actions ----
+    if key == "addchannel":
+        await query.answer()
+        return await _do_addchannel_start(client, chat_id, user_id, entry)
+
+    if key == "mychannels":
+        await query.answer()
+        return await _render_mychannels(entry, user_id)
+
+    # ---- stats / accept ----
+    if key == "stats":
+        await query.answer()
+        return await _do_stats(entry, user_id)
+
+    if key == "accept":
+        await query.answer()
+        return await _do_accept(client, chat_id, user_id, entry)
+
+    # ---- admin-only actions ----
+    if key == "approveuser":
+        if not await is_authorized(user_id):
+            return await query.answer("🚫 Access Denied!", show_alert=True)
+        await query.answer()
+        return await _do_approve_reject(client, chat_id, entry, approve=True)
+
+    if key == "rejectuser":
+        if not await is_authorized(user_id):
+            return await query.answer("🚫 Access Denied!", show_alert=True)
+        await query.answer()
+        return await _do_approve_reject(client, chat_id, entry, approve=False)
+
+    if key == "addadmin":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await _do_add_remove_admin(client, chat_id, entry, add=True)
+
+    if key == "removeadmin":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await _do_add_remove_admin(client, chat_id, entry, add=False)
+
+    if key == "admins":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await _render_admins_list(entry)
+
+    if key == "broadcast":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await _do_broadcast(client, chat_id, entry)
+
+    if key == "clean":
+        if user_id != ADMINS:
+            return await query.answer("🚫 Sirf bot owner ke liye.", show_alert=True)
+        await query.answer()
+        return await run_clean(client, entry)
+
+    await query.answer()
+
+
+# ================= LOGIN (phone + OTP + 2FA -> auto-generates session) ================= #
+# /setsession ke liye pehle se generated session string chahiye thi - Login
+# seedha phone/OTP/password poochh ke khud session bana deta hai, phir usi
+# db.set_session() me save karta hai taaki Add Channel/Accept waghera sab
+# pehle jaisa hi kaam karein.
+
+async def _do_login(client, chat_id, user_id, entry):
+    name = 'default'
+
+    phone_resp = await _listen_text(
+        client, chat_id,
+        f"**📞 Apna Telegram phone number bhejo** (country code ke saath, session name: `{name}`).\n\nExample: `+919876543210`",
+        entry,
+    )
+    if not phone_resp:
+        return
+    if not phone_resp.text:
+        return await phone_resp.reply("❌ **Invalid number** — text me phone number bhejo.")
+
+    phone = phone_resp.text.strip()
+    temp_client = Client(f"login_{user_id}", api_id=API_ID, api_hash=API_HASH, in_memory=True)
+    await temp_client.connect()
+
+    status = await phone_resp.reply("🔄 **OTP bheja ja raha hai…**")
+    try:
+        sent = await temp_client.send_code(phone)
+    except PhoneNumberInvalid:
+        await temp_client.disconnect()
+        return await status.edit("❌ **Invalid phone number!** Menu se dobara Login try karo.")
+    except Exception as e:
+        await temp_client.disconnect()
+        return await status.edit(f"❌ **Error:** `{e}`")
+
+    await status.edit(
+        "📩 **OTP tumhare Telegram app pe bhej diya gaya hai.**\n\n"
+        "Code spaces ke saath bhejo (jaise `1 2 3 4 5`), warna Telegram use "
+        "auto-delete kar deta hai.\n\nCancel: /cancel"
+    )
+    try:
+        otp_resp = await client.listen(chat_id, timeout=300)
+    except asyncio.TimeoutError:
+        await temp_client.disconnect()
+        return await status.edit("⏰ **Time khatam ho gaya.** Menu se dobara Login try karo.")
+
+    if otp_resp.text and otp_resp.text.strip().lower() == "/cancel":
+        await temp_client.disconnect()
+        return await otp_resp.reply("❌ Cancelled.")
+
+    otp = (otp_resp.text or "").strip().replace(" ", "")
+
+    try:
+        await temp_client.sign_in(phone, sent.phone_code_hash, otp)
+    except PhoneCodeInvalid:
+        await temp_client.disconnect()
+        return await otp_resp.reply("❌ **Wrong OTP!** Menu se dobara Login try karo.")
+    except PhoneCodeExpired:
+        await temp_client.disconnect()
+        return await otp_resp.reply("⏰ **OTP expire ho gaya!** Menu se dobara Login try karo.")
+    except SessionPasswordNeeded:
+        pass_ask = await otp_resp.reply("🔒 **Two-Step Verification hai.** Apna password bhejo:")
+        try:
+            pass_resp = await client.listen(chat_id, timeout=300)
         except asyncio.TimeoutError:
-            return await ask.edit("⏰ **Time khatam ho gaya.** Dobara `/setsession` bhejo.")
+            await temp_client.disconnect()
+            return await pass_ask.edit("⏰ **Time khatam ho gaya.** Menu se dobara Login try karo.")
+        if pass_resp.text and pass_resp.text.strip().lower() == "/cancel":
+            await temp_client.disconnect()
+            return await pass_resp.reply("❌ Cancelled.")
+        try:
+            await temp_client.check_password(pass_resp.text.strip())
+        except PasswordHashInvalid:
+            await temp_client.disconnect()
+            return await pass_resp.reply("❌ **Wrong password!** Menu se dobara Login try karo.")
+        except Exception as e:
+            await temp_client.disconnect()
+            return await pass_resp.reply(f"❌ **Error:** `{e}`")
+    except Exception as e:
+        await temp_client.disconnect()
+        return await otp_resp.reply(f"❌ **Error:** `{e}`")
 
-        if resp.text and resp.text.strip().lower() == "/cancel":
-            return await resp.reply("❌ Cancelled.")
-        if not resp.text:
-            return await resp.reply("❌ **Invalid session** — text me session bhejo.")
-        session_string = resp.text.strip()
-        target_msg = resp
+    session_string = await temp_client.export_session_string()
+    me = await temp_client.get_me()
+    await temp_client.disconnect()
 
-    checking = await target_msg.reply("**🔎 Session check ho raha hai…**")
+    await db.set_session(user_id, session_string, name)
+    await entry.reply(
+        f"🎉 **Login Successful!**\n"
+        f"👤 Logged in as: {me.mention}\n"
+        f"🔑 Session `{name}` saved.\n\n"
+        f"Ab tum ⚡ Accept Pending use kar sakte ho, ya ➕ Add Channel se is session "
+        f"ke channels save karke auto-accept on kar sakte ho.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
+    )
+
+
+# ================= ADD SESSION (paste an already-generated string) ================= #
+
+async def _do_addsession(client, chat_id, user_id, entry):
+    name = 'default'
+    resp = await _listen_text(
+        client, chat_id,
+        f"**📤 Apna Pyrogram STRING_SESSION bhejo** (session name: `{name}`).\n\n"
+        "⚠️ Yeh sirf tumhare account tak limited rahega, kisi aur ko nahi dikhega.",
+        entry,
+    )
+    if not resp:
+        return
+    if not resp.text:
+        return await resp.reply("❌ **Invalid session** — text me session bhejo.")
+
+    session_string = resp.text.strip()
+    checking = await resp.reply("**🔎 Session check ho raha hai…**")
     me, error = await validate_session(session_string)
 
     if error:
         return await checking.edit(f"**❌ Invalid Session!**\n`{error}`")
 
-    await db.set_session(message.from_user.id, session_string, name)
+    await db.set_session(user_id, session_string, name)
     await checking.edit(
         f"**✅ Session `{name}` Saved Successfully!**\n"
         f"👤 Logged in as: {me.mention}\n\n"
-        f"Ab tum `/accept` use kar sakte ho, ya `/addchannel {name}` se is session "
+        f"Ab tum ⚡ Accept Pending use kar sakte ho, ya ➕ Add Channel se is session "
         f"ke channels save karke auto-accept on kar sakte ho."
     )
 
 
-@Client.on_message(filters.command("mysession") & filters.private)
-async def my_session_cmd(client, message):
-    sessions = await db.get_all_sessions(message.from_user.id)
-    if not sessions:
-        return await message.reply("**❌ Koi session set nahi hai.**\nAdd karne ke liye `/setsession` bhejo.")
-    lines = "\n".join(f"• `{name}`" for name in sessions)
-    await message.reply(
-        f"**✅ Tumhare saved sessions:**\n\n{lines}\n\n"
-        f"Hatane ke liye: `/removesession <name>`"
-    )
-
-
-@Client.on_message(filters.command("removesession") & filters.private)
-async def remove_session_cmd(client, message):
-    name = message.command[1] if len(message.command) > 1 else 'default'
-    removed = await db.remove_session(message.from_user.id, name)
-    if removed:
-        await message.reply(f"**🗑 Session `{name}` remove ho gaya.**")
-    else:
-        await message.reply(f"**⚠️ Session `{name}` mila nahi.**")
-
-
 # ================= OWNER SETTINGS PANEL (GLOBAL SESSION) ================= #
-
-@Client.on_message(filters.command("settings") & filters.private)
-async def settings_cmd(client, message):
-    if message.from_user.id != ADMINS:
-        return await message.reply(
-            "🚫 **Access Denied!**\n\nYeh command sirf bot owner use kar sakta hai."
-        )
-    await render_settings(message)
-
 
 async def render_settings(message_or_query, edit=False):
     has_global = bool(await db.get_global_session())
@@ -253,6 +500,7 @@ async def render_settings(message_or_query, edit=False):
     buttons = InlineKeyboardMarkup([
         [InlineKeyboardButton("🔑 Set/Update Global Session", callback_data="stg_set")],
         [InlineKeyboardButton("🗑 Remove Global Session", callback_data="stg_rm")],
+        [InlineKeyboardButton("🔙 Back", callback_data="menu:admin")],
     ])
 
     if edit:
@@ -298,119 +546,148 @@ async def settings_callback(client, query):
         await render_settings(query.message, edit=True)
 
 
+# ================= SESSION REMOVE (button per saved session) ================= #
+
+@Client.on_callback_query(filters.regex(r"^sessrm:(.+)$"))
+async def cb_remove_session(client, query):
+    user_id = query.from_user.id
+    name = query.matches[0].group(1)
+    removed = await db.remove_session(user_id, name)
+    await query.answer(f"🗑 Session `{name}` removed." if removed else "⚠️ Nahi mila.", show_alert=True)
+    sessions = await db.get_all_sessions(user_id)
+    if not sessions:
+        return await query.message.edit("**❌ Koi session set nahi hai.**")
+    rows = [[InlineKeyboardButton(f"🗑 {n}", callback_data=f"sessrm:{n}")] for n in sessions]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:main")])
+    await query.message.edit("**Kaunsa session remove karna hai?**", reply_markup=InlineKeyboardMarkup(rows))
+
+
 # ================= SAVED CHANNELS (per-user, with per-channel auto-accept) ================= #
 
-@Client.on_message(filters.command("addchannel") & filters.private)
-async def add_channel_cmd(client, message):
-    session_name = message.command[1] if len(message.command) > 1 else 'default'
-
-    if not await db.get_session(message.from_user.id, session_name):
-        return await message.reply(
-            f"❌ **Session `{session_name}` nahi mila.**\n"
-            f"Pehle `/setsession{' ' + session_name if session_name != 'default' else ''}` se apna session add karo."
+async def _do_addchannel_start(client, chat_id, user_id, entry):
+    sessions = await db.get_all_sessions(user_id)
+    if not sessions:
+        return await entry.reply(
+            "❌ **Pehle koi session add karo.**\nMenu se 🔑 Login ya 📤 Add Session use karo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
         )
+    if len(sessions) == 1:
+        return await _ask_channel_for_session(client, chat_id, user_id, entry, next(iter(sessions)))
 
-    ask = await message.reply(
-        "**📤 Channel/Group ki ID bhejo ya wahan se koi message forward karo.**\nCancel: /cancel"
+    rows = [[InlineKeyboardButton(name, callback_data=f"addch_sess:{name}")] for name in sessions]
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:main")])
+    await entry.reply("**Kaunsa session use karna hai is channel ke liye?**", reply_markup=InlineKeyboardMarkup(rows))
+
+
+@Client.on_callback_query(filters.regex(r"^addch_sess:(.+)$"))
+async def cb_addchannel_pick_session(client, query):
+    session_name = query.matches[0].group(1)
+    await query.answer()
+    await _ask_channel_for_session(client, query.message.chat.id, query.from_user.id, query.message, session_name)
+
+
+async def _ask_channel_for_session(client, chat_id, user_id, entry, session_name):
+    resp = await _listen_text(
+        client, chat_id,
+        "**📤 Channel/Group ki ID bhejo ya wahan se koi message forward karo.**",
+        entry, timeout=120,
     )
-    try:
-        resp = await client.listen(message.chat.id, timeout=120)
-    except asyncio.TimeoutError:
-        return await ask.edit("⏰ Time khatam ho gaya.")
+    if not resp:
+        return
 
-    if resp.text and resp.text.strip().lower() == "/cancel":
-        return await resp.reply("❌ Cancelled.")
-
-    chat_id, title = None, None
+    ch_id, title = None, None
     if resp.forward_from_chat:
-        chat_id = resp.forward_from_chat.id
+        ch_id = resp.forward_from_chat.id
         title = resp.forward_from_chat.title
     elif resp.text:
         try:
-            chat_id = int(resp.text.strip())
+            ch_id = int(resp.text.strip())
         except ValueError:
             return await resp.reply("❌ Invalid ID.")
 
-    if not chat_id:
+    if not ch_id:
         return await resp.reply("❌ Invalid Input.")
 
     if not title:
         try:
-            chat = await client.get_chat(chat_id)
+            chat = await client.get_chat(ch_id)
             title = chat.title
         except Exception:
-            title = str(chat_id)
+            title = str(ch_id)
 
-    await db.add_channel(message.from_user.id, chat_id, title=title, session_name=session_name)
+    await db.add_channel(user_id, ch_id, title=title, session_name=session_name)
     await resp.reply(
-        f"✅ **Channel Saved:** {title} (`{chat_id}`)\n"
+        f"✅ **Channel Saved:** {title} (`{ch_id}`)\n"
         f"🔑 Session: `{session_name}`  |  🔁 Auto-Accept: ✅ ON (default)\n\n"
-        f"Toggle karne ke liye: `/toggleauto {chat_id}`"
+        f"Toggle/remove karne ke liye 📂 My Channels menu use karo.",
+        reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
     )
 
 
-@Client.on_message(filters.command("mychannels") & filters.private)
-async def my_channels_cmd(client, message):
-    channels = await db.get_user_channels(message.from_user.id)
+async def _render_mychannels(entry, user_id):
+    channels = await db.get_user_channels(user_id)
     if not channels:
-        return await message.reply("**Koi saved channel nahi hai.**\nAdd karne ke liye `/addchannel` bhejo.")
+        return await entry.reply(
+            "**Koi saved channel nahi hai.**\nAdd karne ke liye ➕ Add Channel use karo.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
+        )
 
-    lines = []
+    text_lines = ["**📂 Your Saved Channels:**\n"]
+    rows = []
     for ch in channels:
         state = "✅ ON" if ch.get('auto_accept', True) else "❌ OFF"
-        lines.append(
-            f"• {ch.get('title') or ch['chat_id']} (`{ch['chat_id']}`) — "
-            f"Session: `{ch.get('session_name', 'default')}` | Auto: {state}"
-        )
-    await message.reply("**📂 Your Saved Channels:**\n\n" + "\n".join(lines))
+        title = ch.get('title') or str(ch['chat_id'])
+        text_lines.append(f"• {title} (`{ch['chat_id']}`) — Session: `{ch.get('session_name', 'default')}` | Auto: {state}")
+        rows.append([
+            InlineKeyboardButton(f"🔁 Toggle {title[:15]}", callback_data=f"chtg:{ch['chat_id']}"),
+            InlineKeyboardButton("🗑 Remove", callback_data=f"chrm:{ch['chat_id']}"),
+        ])
+    rows.append([InlineKeyboardButton("🔙 Back", callback_data="menu:main")])
+    await entry.reply("\n".join(text_lines), reply_markup=InlineKeyboardMarkup(rows))
 
 
-@Client.on_message(filters.command("removechannel") & filters.private)
-async def remove_channel_cmd(client, message):
-    if len(message.command) < 2:
-        return await message.reply("**Usage:** `/removechannel chat_id`")
-    try:
-        chat_id = int(message.command[1])
-    except ValueError:
-        return await message.reply("❌ Invalid ID.")
-    removed = await db.remove_channel(message.from_user.id, chat_id)
-    await message.reply("✅ Removed." if removed else "⚠️ Yeh channel tumhare saved list me nahi hai.")
-
-
-@Client.on_message(filters.command("toggleauto") & filters.private)
-async def toggle_auto_cmd(client, message):
-    if len(message.command) < 2:
-        return await message.reply("**Usage:** `/toggleauto chat_id`")
-    try:
-        chat_id = int(message.command[1])
-    except ValueError:
-        return await message.reply("❌ Invalid ID.")
-    new_val = await db.toggle_auto_accept(message.from_user.id, chat_id)
+@Client.on_callback_query(filters.regex(r"^chtg:(-?\d+)$"))
+async def cb_toggle_channel(client, query):
+    user_id = query.from_user.id
+    chat_id = int(query.matches[0].group(1))
+    new_val = await db.toggle_auto_accept(user_id, chat_id)
     if new_val is None:
-        return await message.reply("⚠️ Pehle `/addchannel` se yeh channel save karo.")
-    await message.reply(f"✅ Auto-Accept ab **{'ON' if new_val else 'OFF'}** hai is channel ke liye.")
+        return await query.answer("⚠️ Pehle Add Channel se yeh channel save karo.", show_alert=True)
+    await query.answer(f"✅ Auto-Accept ab {'ON' if new_val else 'OFF'} hai.")
+    await _render_mychannels(query.message, user_id)
+
+
+@Client.on_callback_query(filters.regex(r"^chrm:(-?\d+)$"))
+async def cb_remove_channel(client, query):
+    user_id = query.from_user.id
+    chat_id = int(query.matches[0].group(1))
+    removed = await db.remove_channel(user_id, chat_id)
+    await query.answer("✅ Removed." if removed else "⚠️ Not found.", show_alert=True)
+    await _render_mychannels(query.message, user_id)
 
 
 # ================= STATS (per-channel breakdown) ================= #
 
-@Client.on_message(filters.command("stats") & filters.private)
-async def stats_cmd(client, message):
-    if message.from_user.id == ADMINS:
+async def _do_stats(entry, user_id):
+    back_btn = InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
+
+    if user_id == ADMINS:
         total_users = await db.total_users_count()
         all_stats = await db.get_all_stats()
         grand_total = sum(s.get('total', 0) for s in all_stats)
         top = sorted(all_stats, key=lambda s: s.get('total', 0), reverse=True)[:15]
         lines = "\n".join(f"• `{s['chat_id']}` → `{s.get('total', 0)}`" for s in top) or "—"
-        return await message.reply(
+        return await entry.reply(
             f"**📊 Bot-Wide Stats**\n\n"
             f"👥 Total Bot Users: `{total_users}`\n"
             f"✅ Total Requests Accepted (all channels): `{grand_total}`\n\n"
-            f"**Top Channels:**\n{lines}"
+            f"**Top Channels:**\n{lines}",
+            reply_markup=back_btn,
         )
 
-    channels = await db.get_user_channels(message.from_user.id)
+    channels = await db.get_user_channels(user_id)
     if not channels:
-        return await message.reply("**Tumne koi channel save nahi kiya.**\nUse `/addchannel` first.")
+        return await entry.reply("**Tumne koi channel save nahi kiya.**\nUse ➕ Add Channel first.", reply_markup=back_btn)
 
     lines, grand_total = [], 0
     for ch in channels:
@@ -419,122 +696,88 @@ async def stats_cmd(client, message):
         state = "✅ ON" if ch.get('auto_accept', True) else "❌ OFF"
         lines.append(f"• {ch.get('title') or ch['chat_id']} (`{ch['chat_id']}`) — Accepted: `{count}` | Auto: {state}")
 
-    await message.reply(
-        "**📊 Your Channel Stats**\n\n" + "\n".join(lines) + f"\n\n**Total Accepted:** `{grand_total}`"
+    await entry.reply(
+        "**📊 Your Channel Stats**\n\n" + "\n".join(lines) + f"\n\n**Total Accepted:** `{grand_total}`",
+        reply_markup=back_btn,
     )
 
 
 # ================= MANUAL REVIEW (suspicious join requests) ================= #
 
-@Client.on_message(filters.command("approveuser") & filters.private)
-async def approve_user_cmd(client, message):
-    if not await is_authorized(message.from_user.id):
-        return await message.reply("🚫 **Access Denied!**")
-    if len(message.command) < 3:
-        return await message.reply("**Usage:** `/approveuser chat_id user_id`")
+async def _do_approve_reject(client, chat_id, entry, approve: bool):
+    action = "approve" if approve else "reject"
+    resp = await _listen_text(
+        client, chat_id,
+        f"**Chat ID aur User ID bhejo, space se separate** (jise {'approve' if approve else 'reject'} karna hai).\n\nExample: `-1001234567890 123456789`",
+        entry,
+    )
+    if not resp or not resp.text:
+        return
+    parts = resp.text.split()
+    if len(parts) < 2:
+        return await resp.reply("❌ **Usage:** `chat_id user_id`")
     try:
-        chat_id, user_id = int(message.command[1]), int(message.command[2])
+        target_chat_id, target_user_id = int(parts[0]), int(parts[1])
     except ValueError:
-        return await message.reply("❌ Invalid IDs.")
-    try:
-        await client.approve_chat_join_request(chat_id, user_id)
-        await db.increment_stats(chat_id, 1)
-        await message.reply("✅ Approved.")
-    except Exception as e:
-        await message.reply(f"❌ Error: `{e}`")
-
-
-@Client.on_message(filters.command("rejectuser") & filters.private)
-async def reject_user_cmd(client, message):
-    if not await is_authorized(message.from_user.id):
-        return await message.reply("🚫 **Access Denied!**")
-    if len(message.command) < 3:
-        return await message.reply("**Usage:** `/rejectuser chat_id user_id`")
-    try:
-        chat_id, user_id = int(message.command[1]), int(message.command[2])
-    except ValueError:
-        return await message.reply("❌ Invalid IDs.")
-    try:
-        await client.decline_chat_join_request(chat_id, user_id)
-        await message.reply("🗑 Rejected.")
-    except Exception as e:
-        await message.reply(f"❌ Error: `{e}`")
-
-
-@Client.on_message(filters.command("addadmin") & filters.private)
-async def add_admin(client, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply(
-            "🚫 **Access Denied!**\n\n"
-            "Yeh command sirf bot owner use kar sakta hai."
-        )
-
-    if len(message.command) < 2:
-        return await message.reply(
-            "❌ **Usage:** `/addadmin user_id`\n"
-            "**Example:** `/addadmin 123456789`"
-        )
+        return await resp.reply("❌ Invalid IDs.")
 
     try:
-        user_id = int(message.command[1])
-        added = await db.add_admin(user_id)
-        if added:
-            await message.reply(f"✅ **User `{user_id}` ko admin bana diya gaya!**")
+        if approve:
+            await client.approve_chat_join_request(target_chat_id, target_user_id)
+            await db.increment_stats(target_chat_id, 1)
+            await resp.reply("✅ Approved.")
         else:
-            await message.reply(f"⚠️ **User `{user_id}` pehle se admin hai!**")
-    except ValueError:
-        await message.reply("❌ **Invalid user ID!**")
+            await client.decline_chat_join_request(target_chat_id, target_user_id)
+            await resp.reply("🗑 Rejected.")
+    except Exception as e:
+        await resp.reply(f"❌ Error: `{e}`")
 
 
-# ================= REMOVE ADMIN (OWNER ONLY) ================= #
+# ================= ADMIN MANAGEMENT (OWNER ONLY) ================= #
 
-@Client.on_message(filters.command("removeadmin") & filters.private)
-async def remove_admin(client, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply(
-            "🚫 **Access Denied!**\n\n"
-            "Yeh command sirf bot owner use kar sakta hai."
-        )
-
-    if len(message.command) < 2:
-        return await message.reply(
-            "❌ **Usage:** `/removeadmin user_id`\n"
-            "**Example:** `/removeadmin 123456789`"
-        )
-
+async def _do_add_remove_admin(client, chat_id, entry, add: bool):
+    resp = await _listen_text(
+        client, chat_id,
+        f"**User ID bhejo jise {'admin banana' if add else 'admin se hatana'} hai:**",
+        entry,
+    )
+    if not resp or not resp.text:
+        return
     try:
-        user_id = int(message.command[1])
-        removed = await db.remove_admin(user_id)
-        if removed:
-            await message.reply(f"✅ **User `{user_id}` ko admin se hata diya gaya!**")
-        else:
-            await message.reply(f"⚠️ **User `{user_id}` admin nahi tha!**")
+        target_id = int(resp.text.strip())
     except ValueError:
-        await message.reply("❌ **Invalid user ID!**")
+        return await resp.reply("❌ **Invalid user ID!**")
+
+    if add:
+        added = await db.add_admin(target_id)
+        msg = f"✅ **User `{target_id}` ko admin bana diya gaya!**" if added else f"⚠️ **User `{target_id}` pehle se admin hai!**"
+    else:
+        removed = await db.remove_admin(target_id)
+        msg = f"✅ **User `{target_id}` ko admin se hata diya gaya!**" if removed else f"⚠️ **User `{target_id}` admin nahi tha!**"
+
+    await resp.reply(msg)
 
 
-# ================= ADMINS LIST (OWNER ONLY) ================= #
-
-@Client.on_message(filters.command("admins") & filters.private)
-async def admins_list(client, message):
-
-    if message.from_user.id != ADMINS:
-        return await message.reply(
-            "🚫 **Access Denied!**\n\n"
-            "Yeh command sirf bot owner use kar sakta hai."
-        )
-
+async def _render_admins_list(entry):
     admins = await db.get_all_admins()
-
     text = "👑 **Admin List:**\n\n"
     text += f"`1.` `{ADMINS}` — 👑 Owner\n"
-
     for i, admin_id in enumerate(admins, 2):
         text += f"`{i}.` `{admin_id}`\n"
+    await entry.reply(text, reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Back", callback_data="menu:manageadmins")]]))
 
-    await message.reply(text)
+
+# ================= BROADCAST (OWNER ONLY) ================= #
+
+async def _do_broadcast(client, chat_id, entry):
+    resp = await _listen_text(
+        client, chat_id,
+        "**📢 Jo message broadcast karna hai woh bhejo ya forward karo** (text/photo/video, kuch bhi).",
+        entry,
+    )
+    if not resp:
+        return
+    await run_broadcast(client, resp, resp)
 
 
 # ================= APPROVE FUNCTION ================= #
@@ -671,22 +914,21 @@ async def process_all_requests(acc, chat_ids, msg):
     )
 
 
-# ================= /ACCEPT (ANY USER WITH A SESSION, OR AUTHORIZED ADMIN) ================= #
+# ================= ACCEPT (ANY USER WITH A SESSION, OR AUTHORIZED ADMIN) ================= #
 
-@Client.on_message(filters.command("accept") & filters.private)
-async def accept(client, message):
-
-    session_string = await get_session_for(message.from_user.id)
+async def _do_accept(client, chat_id, user_id, entry):
+    session_string = await get_session_for(user_id)
 
     if not session_string:
-        return await message.reply(
+        return await entry.reply(
             "🚫 **Access Denied!**\n\n"
             "Aapka koi STRING_SESSION set nahi hai.\n"
-            "Apna khud ka session add karke bot use karne ke liye `/setsession` bhejo — "
-            "phir aap apne khud ke channels/groups ke pending requests accept kar paoge."
+            "Menu se 🔑 Login ya 📤 Add Session use karo — phir aap apne khud ke "
+            "channels/groups ke pending requests accept kar paoge.",
+            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Menu", callback_data="menu:main")]])
         )
 
-    show = await message.reply("**Please Wait…**")
+    show = await entry.reply("**Please Wait…**")
     acc = None
 
     try:
@@ -703,28 +945,12 @@ async def accept(client, message):
         return await show.edit(f"**❌ Session Error:** `{e}`")
 
     try:
-        await send_log(client, message, "approve")
-
-        if len(message.command) > 1:
-            raw_ids = message.text.split()[1:]
-            chat_ids = []
-            for x in raw_ids:
-                try:
-                    chat_ids.append(int(x))
-                except ValueError:
-                    await message.reply(f"**Invalid ID:** `{x}` — sirf numbers daalein")
-            if not chat_ids:
-                return
-            msg = await show.edit("**⚡ Processing…**")
-            await process_all_requests(acc, chat_ids, msg)
-            return
-
         await show.edit(
             "**Send Channel ID / Multiple IDs\n"
             "Or Forward Message From Channel**"
         )
 
-        vj = await client.listen(message.chat.id)
+        vj = await client.listen(chat_id)
         chat_ids = []
 
         if (
@@ -741,7 +967,7 @@ async def accept(client, message):
                 except ValueError:
                     pass
         else:
-            return await message.reply("**❌ Invalid Input**")
+            return await entry.reply("**❌ Invalid Input**")
 
         await vj.delete()
 
@@ -754,6 +980,7 @@ async def accept(client, message):
     finally:
         if acc and acc.is_connected:
             await acc.disconnect()
+
 
 
 # ================= AUTO ACCEPT ON BOT PROMOTED TO ADMIN ================= #
@@ -902,13 +1129,14 @@ GEMINI_URL = f"https://generativelanguage.googleapis.com/v1beta/models/{GEMINI_M
 AI_SYSTEM_PROMPT = (
     "Tum 'Mrn Officialx Join Request Acceptor Bot' ke helpful support assistant ho, "
     "yeh Telegram bot channel/group ke join requests auto-accept karta hai. "
-    "User ke sawalon ka short, friendly, Hinglish me reply do. Bot ke commands: "
-    "/setsession (apna Pyrogram STRING_SESSION add karo), /mysession, /removesession, "
-    "/addchannel (session ke saath channel save karo, auto-accept ke liye), /mychannels, "
-    "/removechannel, /toggleauto (kisi channel ka auto-accept on/off), /accept "
-    "(pending requests turant accept karo), /stats. Bot ko channel/group me admin "
-    "banao 'Invite Users' permission ke saath, tabhi yeh kaam karega. Jawab crisp "
-    "rakho, zyada lamba mat likho."
+    "User ke sawalon ka short, friendly, Hinglish me reply do. Yeh bot ab poora "
+    "button-menu se chalta hai - koi command yaad rakhne ki zaroorat nahi. User "
+    "/start bheje, phir 'Open Menu' button dabaye - wahan se Login, Add Session, "
+    "My Sessions, Remove Session, Add Channel, My Channels, Stats, Accept Pending, "
+    "aur (admin/owner ke liye) Admin Panel (Approve/Reject User, Manage Admins, "
+    "Broadcast, Clean DB, Global Session) - sab kuch buttons se milta hai. Bot ko "
+    "channel/group me admin banao 'Invite Users' permission ke saath, tabhi yeh "
+    "kaam karega. Jawab crisp rakho, zyada lamba mat likho."
 )
 
 
@@ -949,12 +1177,7 @@ async def ask_gemini(prompt: str):
 # taaki normal command flow (aur unke andar wale client.listen() waits,
 # jaise /setsession, /addchannel, /settings) kabhi bhi is se clash na
 # karein.
-_KNOWN_COMMANDS = [
-    "start", "setsession", "mysession", "removesession", "settings",
-    "addchannel", "mychannels", "removechannel", "toggleauto", "stats",
-    "approveuser", "rejectuser", "addadmin", "removeadmin", "admins",
-    "accept", "broadcast", "clean", "cancel",
-]
+_KNOWN_COMMANDS = ["start", "cancel"]
 
 
 @Client.on_message(
