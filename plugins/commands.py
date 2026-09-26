@@ -130,7 +130,7 @@ async def start_message(c, m):
         parse_mode=enums.ParseMode.HTML,
         reply_markup=InlineKeyboardMarkup(
             [
-                [InlineKeyboardButton("🛠 Open Menu", callback_data="menu:main")],
+                [InlineKeyboardButton("🛠 Open Settings", callback_data="menu:main")],
                 [
                     InlineKeyboardButton(
                         "➕ Add Me To Your Channel",
