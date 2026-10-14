@@ -1,7 +1,8 @@
 from pyrogram.errors import InputUserDeactivated, FloodWait, UserIsBlocked, PeerIdInvalid
+from pyrogram import enums
 from plugins.database import db
-from pyrogram import Client, filters
-from config import ADMINS
+from plugins import ui
+from plugins.ui import note, screen, kv, quote
 import asyncio
 import datetime
 import time
@@ -9,6 +10,8 @@ import logging
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
+
+HTML = enums.ParseMode.HTML
 
 
 async def broadcast_messages(user_id, message):
@@ -29,6 +32,17 @@ async def broadcast_messages(user_id, message):
         return "Error"
 
 
+def _progress(done, total, success, blocked, deleted, failed) -> str:
+    return screen(
+        "📢", "Broadcast in progress",
+        quote("\n".join([
+            kv("Users", total), kv("Done", f"{done}/{total}"),
+            kv("Success", success), kv("Blocked", blocked),
+            kv("Deleted", deleted), kv("Failed", failed),
+        ])),
+    )
+
+
 async def run_broadcast(bot, admin_message, b_msg):
     """Core broadcast loop - takes the message to copy out (b_msg) and
     reports progress into admin_message. Called from the button-menu
@@ -38,9 +52,9 @@ async def run_broadcast(bot, admin_message, b_msg):
     total_users = await db.total_users_count()
 
     if total_users == 0:
-        return await admin_message.reply_text("❌ No users in database.")
+        return await admin_message.reply_text(ui.finish(note("err", "No users in the database")), parse_mode=HTML)
 
-    sts = await admin_message.reply_text("🚀 Broadcast Started...")
+    sts = await admin_message.reply_text(ui.finish(note("ok", "Broadcast started")), parse_mode=HTML)
     start_time = time.time()
 
     done = success = blocked = deleted = failed = 0
@@ -67,32 +81,26 @@ async def run_broadcast(bot, admin_message, b_msg):
         await asyncio.sleep(0.05)
 
         if done % 25 == 0:
-            await sts.edit(
-                f"📢 Broadcast In Progress...\n\n"
-                f"👥 Total Users: {total_users}\n"
-                f"✅ Success: {success}\n"
-                f"🚫 Blocked: {blocked}\n"
-                f"🗑 Deleted: {deleted}\n"
-                f"❌ Failed: {failed}\n"
-                f"📊 Completed: {done}/{total_users}"
-            )
+            await sts.edit(ui.finish(_progress(done, total_users, success, blocked, deleted, failed)), parse_mode=HTML)
 
     time_taken = datetime.timedelta(seconds=int(time.time() - start_time))
     await sts.edit(
-        f"✅ Broadcast Completed!\n\n"
-        f"⏱ Time Taken: {time_taken}\n\n"
-        f"👥 Total Users: {total_users}\n"
-        f"✅ Success: {success}\n"
-        f"🚫 Blocked: {blocked}\n"
-        f"🗑 Deleted: {deleted}\n"
-        f"❌ Failed: {failed}"
+        ui.finish(screen(
+            "✅", "Broadcast complete",
+            quote("\n".join([
+                kv("Time taken", str(time_taken)), kv("Users", total_users),
+                kv("Success", success), kv("Blocked", blocked),
+                kv("Deleted", deleted), kv("Failed", failed),
+            ])),
+        )),
+        parse_mode=HTML,
     )
 
 
 async def run_clean(bot, admin_message):
     """Core DB-cleanup loop, called from the button-menu handler."""
     users = await db.get_all_users()
-    sts = await admin_message.reply_text("🧹 Checking users...")
+    sts = await admin_message.reply_text(ui.finish(note("info", "Checking users…")), parse_mode=HTML)
     removed = checked = 0
 
     async for user in users:
@@ -101,15 +109,14 @@ async def run_clean(bot, admin_message):
             continue
         try:
             await bot.get_users(int(user_id))
-        except:
+        except Exception:
             await db.delete_user(int(user_id))
             removed += 1
         checked += 1
         if checked % 25 == 0:
-            await sts.edit(f"🔍 Checked: {checked}\n🗑 Removed: {removed}")
+            await sts.edit(ui.finish(note("info", "Checking users…", kv("Checked", checked) + "\n" + kv("Removed", removed))), parse_mode=HTML)
 
     await sts.edit(
-        f"✅ Clean Completed!\n\n"
-        f"🔍 Total Checked: {checked}\n"
-        f"🗑 Total Removed: {removed}"
+        ui.finish(note("ok", "Clean-up complete", kv("Checked", checked) + "\n" + kv("Removed", removed))),
+        parse_mode=HTML,
     )

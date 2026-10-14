@@ -1,6 +1,7 @@
 import motor.motor_asyncio
 from datetime import datetime
 from config import DB_NAME, DB_URI
+from plugins.crypto import encrypt_session, decrypt_session
 
 
 class Database:
@@ -79,8 +80,9 @@ class Database:
         return {}
 
     async def set_session(self, user_id, session_string, name='default'):
+        """Encrypts before writing — see plugins/crypto.py."""
         sessions = await self._raw_sessions(user_id)
-        sessions[name] = session_string
+        sessions[name] = encrypt_session(session_string)
         await self.session_col.update_one(
             {'id': int(user_id)},
             {'$set': {'sessions': sessions}, '$unset': {'session': ""}},
@@ -88,15 +90,30 @@ class Database:
         )
 
     async def get_session(self, user_id, name='default'):
+        """Decrypts on read; transparently reads an older unencrypted value too."""
         sessions = await self._raw_sessions(user_id)
+        raw = None
         if name in sessions:
-            return sessions[name]
-        if sessions and name == 'default':
-            return next(iter(sessions.values()))  # only one saved -> use it as default
-        return None
+            raw = sessions[name]
+        elif sessions and name == 'default':
+            raw = next(iter(sessions.values()))  # only one saved -> use it as default
+        return decrypt_session(raw) if raw else None
 
     async def get_all_sessions(self, user_id):
-        return await self._raw_sessions(user_id)
+        """name -> decrypted session string, for every saved session."""
+        sessions = await self._raw_sessions(user_id)
+        out = {}
+        for name, raw in sessions.items():
+            value = decrypt_session(raw)
+            if value:
+                out[name] = value
+        return out
+
+    async def get_raw_session(self, user_id, name='default'):
+        """The still-encrypted value, only for passing through to encrypt_session
+        unchanged (e.g. re-saving under a new name) without round-tripping plaintext."""
+        sessions = await self._raw_sessions(user_id)
+        return sessions.get(name)
 
     async def remove_session(self, user_id, name='default'):
         sessions = await self._raw_sessions(user_id)
@@ -112,15 +129,18 @@ class Database:
     # ===== GLOBAL STRING_SESSION (owner-set via /settings, like store bot) =====
 
     async def set_global_session(self, session_string):
+        """Encrypts before writing — see plugins/crypto.py."""
         await self.settings_col.update_one(
             {'_id': 'global'},
-            {'$set': {'session': session_string}},
+            {'$set': {'session': encrypt_session(session_string)}},
             upsert=True
         )
 
     async def get_global_session(self):
         doc = await self.settings_col.find_one({'_id': 'global'})
-        return doc['session'] if doc else None
+        if not doc:
+            return None
+        return decrypt_session(doc['session'])
 
     async def remove_global_session(self):
         result = await self.settings_col.delete_one({'_id': 'global'})

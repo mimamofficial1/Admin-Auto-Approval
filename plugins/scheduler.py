@@ -6,6 +6,7 @@ from pyrogram.errors import FloodWait
 
 from config import API_ID, API_HASH, ADMINS
 from plugins.database import db
+from plugins.crypto import decrypt_session
 from plugins.commands import approve_requests, validate_session
 
 logger = logging.getLogger(__name__)
@@ -80,7 +81,10 @@ async def session_health_loop(bot):
             async for doc in db.session_col.find({}):
                 user_id = doc['id']
                 sessions = doc.get('sessions') or ({'default': doc['session']} if 'session' in doc else {})
-                for name, session_string in sessions.items():
+                for name, raw_session in sessions.items():
+                    session_string = decrypt_session(raw_session)
+                    if not session_string:
+                        continue  # couldn't decrypt (key rotated) — nothing to validate
                     _me, error = await validate_session(session_string)
                     if error:
                         try:
