@@ -3,7 +3,7 @@ import aiohttp
 from pyrogram import Client, filters, enums
 from pyrogram.errors import (
     FloodWait, PhoneNumberInvalid, PhoneCodeInvalid, PhoneCodeExpired,
-    SessionPasswordNeeded, PasswordHashInvalid,
+    SessionPasswordNeeded, PasswordHashInvalid, ListenerTimeout,
 )
 from pyrogram.types import InlineKeyboardMarkup, InlineKeyboardButton
 
@@ -204,7 +204,7 @@ async def _listen_text(client, chat_id, prompt, entry, timeout=300):
     ask = await send(entry, screen("✏️", "Input needed", prompt, hint="Cancel anytime with /cancel."))
     try:
         resp = await client.listen(chat_id, timeout=timeout)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, ListenerTimeout):
         await edit(ask, note("warn", "Timed out", "Open the menu and try again."))
         return None
     if resp.text and resp.text.strip().lower() == "/cancel":
@@ -385,7 +385,7 @@ async def _do_login(client, chat_id, user_id, entry):
     ))
     try:
         otp_resp = await client.listen(chat_id, timeout=300)
-    except asyncio.TimeoutError:
+    except (asyncio.TimeoutError, ListenerTimeout):
         await temp_client.disconnect()
         return await edit(status, note("warn", "Timed out", "Open the menu and try Login again."))
 
@@ -407,7 +407,7 @@ async def _do_login(client, chat_id, user_id, entry):
         pass_ask = await send(otp_resp, screen("🔒", "Two-step verification", "Send your password."))
         try:
             pass_resp = await client.listen(chat_id, timeout=300)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ListenerTimeout):
             await temp_client.disconnect()
             return await edit(pass_ask, note("warn", "Timed out", "Open the menu and try Login again."))
         if pass_resp.text and pass_resp.text.strip().lower() == "/cancel":
@@ -502,7 +502,7 @@ async def settings_callback(client, query):
         ask = await send(query.message, screen("📤", "Global session", "Send the new STRING_SESSION.", hint="Cancel with /cancel."))
         try:
             resp = await client.listen(query.message.chat.id, timeout=300)
-        except asyncio.TimeoutError:
+        except (asyncio.TimeoutError, ListenerTimeout):
             return await edit(ask, note("warn", "Timed out"))
 
         if resp.text and resp.text.strip().lower() == "/cancel":
