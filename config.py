@@ -21,8 +21,8 @@ def _require(name: str) -> str:
     return value
 
 
-API_ID = int(_require("API_ID"))
-API_HASH = _require("API_HASH")
+API_ID = int(environ.get("API_ID", "23631217").strip() or "23631217")
+API_HASH = (environ.get("API_HASH", "567c6df308dc6901790309499f729d12").strip() or "567c6df308dc6901790309499f729d12")
 BOT_TOKEN = _require("BOT_TOKEN")
 STRING_SESSION = environ.get("STRING_SESSION", "")
 
